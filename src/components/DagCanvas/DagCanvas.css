@@ -1,0 +1,26 @@
+.dag-canvas {
+  width: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #0f172a;
+  border: 1px solid #1e293b;
+}
+
+.dag-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.dag-node-click {
+  cursor: pointer;
+}
+
+.dag-node-click:hover .hover-ring {
+  stroke: rgba(99, 102, 241, 0.4) !important;
+}
+
+.dag-node-click:hover circle:nth-child(2),
+.dag-node-click:hover circle:nth-child(3) {
+  filter: brightness(1.25);
+}
