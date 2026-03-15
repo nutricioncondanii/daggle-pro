@@ -158,77 +158,102 @@ function enforceSpacing(layer: string[], posX: Map<string, number>, gap: number,
   for (const n of layer) posX.set(n, (posX.get(n) || 0) + shift);
 }
 
-/** Build a curved path (quadratic bezier) between two nodes.
- *  `curveOffset` shifts the control point sideways to separate overlapping edges. */
-function edgePath(
-  sx: number, sy: number, tx: number, ty: number, curveOffset: number
-): string {
-  const dx = tx - sx, dy = ty - sy;
-  const len = Math.sqrt(dx * dx + dy * dy);
-  if (len < 1) return `M${sx},${sy} L${tx},${ty}`;
-  const ux = dx / len, uy = dy / len;
-
-  // Shorten start/end to circle edge
-  const x1 = sx + ux * (R + 3);
-  const y1 = sy + uy * (R + 3);
-  const x2 = tx - ux * (R + 10);
-  const y2 = ty - uy * (R + 10);
-
-  if (Math.abs(curveOffset) < 1) {
-    // Straight line
-    return `M${x1},${y1} L${x2},${y2}`;
-  }
-
-  // Control point: midpoint + perpendicular offset
-  const mx = (x1 + x2) / 2;
-  const my = (y1 + y2) / 2;
-  // Perpendicular direction
-  const px = -uy * curveOffset;
-  const py = ux * curveOffset;
-  return `M${x1},${y1} Q${mx + px},${my + py} ${x2},${y2}`;
-}
-
-/** Calculate curve offsets for edges sharing the same target or source */
-function computeCurveOffsets(edges: { source: string; target: string }[]): number[] {
-  const offsets = new Array(edges.length).fill(0);
-
-  // Group edges by target node
+/**
+ * Build edge paths that don't overlap.
+ *
+ * Strategy: for each edge, compute the angle from source to target.
+ * When multiple edges leave the same source, spread their exit angles.
+ * When multiple edges arrive at the same target, spread their entry angles.
+ * Use quadratic bezier curves so the paths visually separate.
+ */
+function buildEdgePaths(
+  edges: { source: string; target: string }[],
+  posMap: Map<string, Pos>,
+): string[] {
+  // Group edge indices by source and by target
+  const bySource = new Map<string, number[]>();
   const byTarget = new Map<string, number[]>();
   edges.forEach((e, i) => {
-    const key = e.target;
-    if (!byTarget.has(key)) byTarget.set(key, []);
-    byTarget.get(key)!.push(i);
+    if (!bySource.has(e.source)) bySource.set(e.source, []);
+    bySource.get(e.source)!.push(i);
+    if (!byTarget.has(e.target)) byTarget.set(e.target, []);
+    byTarget.get(e.target)!.push(i);
   });
 
-  // For groups of 2+ edges going to same target, spread them
-  for (const indices of byTarget.values()) {
+  // For each edge, compute a "curve factor" based on how many siblings it has
+  // and its position among them (sorted by target/source angle)
+  const curveFactor = new Array(edges.length).fill(0);
+
+  // Process edges sharing a SOURCE: sort by angle to their targets, spread
+  for (const [srcId, indices] of bySource) {
     if (indices.length < 2) continue;
-    const spread = 25;
-    for (let j = 0; j < indices.length; j++) {
-      offsets[indices[j]] = (j - (indices.length - 1) / 2) * spread;
+    const src = posMap.get(srcId)!;
+    // Sort by angle to target
+    const sorted = [...indices].sort((a, b) => {
+      const ta = posMap.get(edges[a].target)!;
+      const tb = posMap.get(edges[b].target)!;
+      return Math.atan2(ta.y - src.y, ta.x - src.x) - Math.atan2(tb.y - src.y, tb.x - src.x);
+    });
+    // Assign curve factor: spread evenly from -1 to +1
+    for (let j = 0; j < sorted.length; j++) {
+      const t = sorted.length === 1 ? 0 : (j / (sorted.length - 1)) * 2 - 1;
+      curveFactor[sorted[j]] += t;
     }
   }
 
-  // Same for source
-  const bySource = new Map<string, number[]>();
-  edges.forEach((e, i) => {
-    const key = e.source;
-    if (!bySource.has(key)) bySource.set(key, []);
-    bySource.get(key)!.push(i);
-  });
-
-  for (const indices of bySource.values()) {
+  // Process edges sharing a TARGET: sort by angle from their sources, spread
+  for (const [tgtId, indices] of byTarget) {
     if (indices.length < 2) continue;
-    // Only apply if no offset already set (don't double-offset)
-    const needOffset = indices.filter(i => offsets[i] === 0);
-    if (needOffset.length < 2) continue;
-    const spread = 20;
-    for (let j = 0; j < needOffset.length; j++) {
-      offsets[needOffset[j]] += (j - (needOffset.length - 1) / 2) * spread;
+    const tgt = posMap.get(tgtId)!;
+    const sorted = [...indices].sort((a, b) => {
+      const sa = posMap.get(edges[a].source)!;
+      const sb = posMap.get(edges[b].source)!;
+      return Math.atan2(sa.y - tgt.y, sa.x - tgt.x) - Math.atan2(sb.y - tgt.y, sb.x - tgt.x);
+    });
+    for (let j = 0; j < sorted.length; j++) {
+      const t = sorted.length === 1 ? 0 : (j / (sorted.length - 1)) * 2 - 1;
+      curveFactor[sorted[j]] += t;
     }
   }
 
-  return offsets;
+  // Build SVG paths
+  return edges.map((e, i) => {
+    const src = posMap.get(e.source);
+    const tgt = posMap.get(e.target);
+    if (!src || !tgt) return '';
+
+    const dx = tgt.x - src.x;
+    const dy = tgt.y - src.y;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len < 1) return '';
+
+    const ux = dx / len;
+    const uy = dy / len;
+
+    // Start/end points on circle edges
+    const x1 = src.x + ux * (R + 3);
+    const y1 = src.y + uy * (R + 3);
+    const x2 = tgt.x - ux * (R + 10);
+    const y2 = tgt.y - uy * (R + 10);
+
+    const cf = curveFactor[i];
+
+    if (Math.abs(cf) < 0.15) {
+      // Nearly straight
+      return `M${x1},${y1} L${x2},${y2}`;
+    }
+
+    // Perpendicular offset for control point
+    // Scale by distance so short edges curve less
+    const perpScale = Math.min(len * 0.25, 60);
+    const px = -uy * cf * perpScale;
+    const py = ux * cf * perpScale;
+
+    const mx = (x1 + x2) / 2 + px;
+    const my = (y1 + y2) / 2 + py;
+
+    return `M${x1},${y1} Q${mx},${my} ${x2},${y2}`;
+  });
 }
 
 export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick, height = 420 }: Props) {
@@ -263,12 +288,10 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
 
         {/* Edges */}
         {(() => {
-          const offsets = computeCurveOffsets(graph.edges);
+          const paths = buildEdgePaths(graph.edges, posMap);
           return graph.edges.map((e, i) => {
-            const s = posMap.get(e.source), t = posMap.get(e.target);
-            if (!s || !t) return null;
-            const d = edgePath(s.x, s.y, t.x, t.y, offsets[i]);
-            return <path key={i} d={d} fill="none"
+            if (!paths[i]) return null;
+            return <path key={i} d={paths[i]} fill="none"
               stroke="#94a3b8" strokeWidth={2.5} markerEnd="url(#ah)" />;
           });
         })()}
