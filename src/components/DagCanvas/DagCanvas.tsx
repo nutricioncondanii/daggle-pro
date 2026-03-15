@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState, useCallback } from 'react';
 import { DagGraph, NodeRole } from '../../types/dag';
 import { classifyNodeRole, getRoleColor } from '../../engine/roles';
 import './DagCanvas.css';
@@ -265,51 +265,62 @@ function buildRoutedEdge(waypoints: Pos[]): string {
 
   const first = waypoints[0];
   const last = waypoints[waypoints.length - 1];
+  const dx = last.x - first.x, dy = last.y - first.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1) return '';
+  const ux = dx / len, uy = dy / len;
+
+  // Start/end on circle edges
+  const x1 = first.x + ux * (R + 2);
+  const y1 = first.y + uy * (R + 2);
+  const x2 = last.x - ux * (R + 10);
+  const y2 = last.y - uy * (R + 10);
 
   if (waypoints.length === 2) {
     // Direct edge — straight line
-    const dx = last.x - first.x, dy = last.y - first.y;
-    const len = Math.hypot(dx, dy);
-    if (len < 1) return '';
-    const ux = dx / len, uy = dy / len;
-    return `M${first.x + ux * (R + 2)},${first.y + uy * (R + 2)} L${last.x - ux * (R + 10)},${last.y - uy * (R + 10)}`;
+    return `M${x1},${y1} L${x2},${y2}`;
   }
 
-  // Multi-segment through dummies — polyline
-  const parts: string[] = [];
+  // Multi-segment through dummies — smooth cubic bezier curve
+  // Use dummy positions as curve guidance points
+  const dummies = waypoints.slice(1, -1); // just the intermediate dummy points
 
-  for (let i = 0; i < waypoints.length - 1; i++) {
-    const s = waypoints[i];
-    const t = waypoints[i + 1];
-    const dx = t.x - s.x, dy = t.y - s.y;
-    const len = Math.hypot(dx, dy);
-    if (len < 1) continue;
-    const ux = dx / len, uy = dy / len;
-
-    // First segment: start from circle edge
-    // Last segment: end at circle edge (with arrow space)
-    // Middle segments: point-to-point through dummies
-    const startPad = i === 0 ? R + 2 : 0;
-    const endPad = i === waypoints.length - 2 ? R + 10 : 0;
-
-    const x1 = s.x + ux * startPad;
-    const y1 = s.y + uy * startPad;
-    const x2 = t.x - ux * endPad;
-    const y2 = t.y - uy * endPad;
-
-    if (i === 0) {
-      parts.push(`M${x1},${y1}`);
-    }
-    parts.push(`L${x2},${y2}`);
+  if (dummies.length === 1) {
+    // Single dummy: quadratic bezier through it
+    return `M${x1},${y1} Q${dummies[0].x},${dummies[0].y} ${x2},${y2}`;
   }
 
-  return parts.join(' ');
+  // Multiple dummies: cubic bezier using first and last dummy as control points
+  const cp1 = dummies[0];
+  const cp2 = dummies[dummies.length - 1];
+  return `M${x1},${y1} C${cp1.x},${cp1.y} ${cp2.x},${cp2.y} ${x2},${y2}`;
+}
+
+/** Get all nodes connected to a given node (parents + children) */
+function getConnected(graph: DagGraph, nodeId: string): Set<string> {
+  const connected = new Set<string>();
+  connected.add(nodeId);
+  for (const e of graph.edges) {
+    if (e.source === nodeId) connected.add(e.target);
+    if (e.target === nodeId) connected.add(e.source);
+  }
+  return connected;
+}
+
+/** Get edge indices connected to a node */
+function getConnectedEdges(graph: DagGraph, nodeId: string): Set<number> {
+  const indices = new Set<number>();
+  graph.edges.forEach((e, i) => {
+    if (e.source === nodeId || e.target === nodeId) indices.add(i);
+  });
+  return indices;
 }
 
 // ─── Component ──────────────────────────────────────────────────────
 
 export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick, height = 420 }: Props) {
   const { positions, routes } = useMemo(() => layout(graph), [graph]);
+  const [hoveredNode, setHoveredNode] = useState<string | null>(null);
 
   const posMap = useMemo(() => {
     const m = new Map<string, Pos>();
@@ -317,11 +328,23 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
     return m;
   }, [positions]);
 
-  // Only real nodes (filter out dummies)
   const realPositions = useMemo(
     () => positions.filter(p => !p.id.startsWith('__d_')),
     [positions]
   );
+
+  // Path highlighting: which nodes and edges are connected to hovered node
+  const highlightedNodes = useMemo(
+    () => hoveredNode ? getConnected(graph, hoveredNode) : null,
+    [graph, hoveredNode]
+  );
+  const highlightedEdges = useMemo(
+    () => hoveredNode ? getConnectedEdges(graph, hoveredNode) : null,
+    [graph, hoveredNode]
+  );
+
+  const handleNodeEnter = useCallback((id: string) => setHoveredNode(id), []);
+  const handleNodeLeave = useCallback(() => setHoveredNode(null), []);
 
   const vb = useMemo(() => {
     const padX = 120, padY = 60;
@@ -342,20 +365,32 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
             orient="auto" markerUnits="userSpaceOnUse">
             <polygon points="0 0, 14 5, 0 10" fill="#94a3b8" />
           </marker>
+          <marker id="ah-hi" markerWidth="14" markerHeight="10" refX="12" refY="5"
+            orient="auto" markerUnits="userSpaceOnUse">
+            <polygon points="0 0, 14 5, 0 10" fill="#818cf8" />
+          </marker>
         </defs>
 
-        {/* Edges — routed through dummy waypoints */}
+        {/* Edges */}
         {graph.edges.map((e, i) => {
           const route = routes.get(i);
           if (!route) return null;
           const waypoints = route.map(id => posMap.get(id)).filter(Boolean) as Pos[];
           const d = buildRoutedEdge(waypoints);
           if (!d) return null;
+
+          const isHi = highlightedEdges?.has(i);
+          const isDimmed = hoveredNode && !isHi;
+
           return <path key={`e${i}`} d={d} fill="none"
-            stroke="#94a3b8" strokeWidth={2.5} markerEnd="url(#ah)" />;
+            stroke={isHi ? '#818cf8' : '#94a3b8'}
+            strokeWidth={isHi ? 3 : 2.5}
+            opacity={isDimmed ? 0.15 : 1}
+            markerEnd={isHi ? 'url(#ah-hi)' : 'url(#ah)'}
+            style={{ transition: 'opacity 0.2s, stroke 0.2s' }} />;
         })}
 
-        {/* Nodes (only real, not dummies) */}
+        {/* Nodes */}
         {graph.nodes.map(node => {
           const p = posMap.get(node.id);
           if (!p) return null;
@@ -364,6 +399,9 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
           const isSel = selectedNodes?.has(node.id);
           const role = classifyNodeRole(graph, node.id);
           const clickable = !!onNodeClick && !isExp && !isOut;
+
+          const isHi = highlightedNodes?.has(node.id);
+          const isDimmed = hoveredNode && !isHi;
 
           let fill = '#1e293b';
           let stroke = '#64748b';
@@ -375,8 +413,13 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
           if (showRoles && !isExp && !isOut && !isSel) stroke = getRoleColor(role);
 
           return (
-            <g key={node.id} onClick={() => clickable && onNodeClick!(node.id)}
-              className={clickable ? 'dag-node-click' : undefined}>
+            <g key={node.id}
+              onClick={() => clickable && onNodeClick!(node.id)}
+              onMouseEnter={() => handleNodeEnter(node.id)}
+              onMouseLeave={handleNodeLeave}
+              className={clickable ? 'dag-node-click' : undefined}
+              opacity={isDimmed ? 0.2 : 1}
+              style={{ transition: 'opacity 0.2s' }}>
 
               {isSel && <circle cx={p.x} cy={p.y} r={R + 6} fill="none"
                 stroke="#22d3ee" strokeWidth={1.5} opacity={0.35} />}
