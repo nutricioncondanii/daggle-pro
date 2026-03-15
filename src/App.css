@@ -399,6 +399,62 @@
   font-size: 12px;
 }
 
+/* ── Variable explanation ── */
+.var-explain {
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.var-explain h4 {
+  color: #94a3b8;
+  font-size: 12px;
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.var-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  margin-bottom: 3px;
+  font-size: 13px;
+}
+
+.var-row.in-set {
+  background: rgba(99, 102, 241, 0.08);
+}
+
+.var-icon {
+  width: 18px;
+  text-align: center;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.var-row.in-set .var-icon {
+  color: #4ade80;
+}
+
+.var-row:not(.in-set) .var-icon {
+  color: #64748b;
+}
+
+.var-name {
+  font-weight: 700;
+  color: #e2e8f0;
+  min-width: 30px;
+}
+
+.var-reason {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
 /* ── Explanation ── */
 .explain {
   background: #0f172a;

@@ -4,7 +4,8 @@ import { DagGraph } from './types/dag';
 import { generateRandomDag } from './engine/generator';
 import { findMinimalAdjustmentSets } from './engine/adjustment';
 import { analyzeAllPaths } from './engine/dseparation';
-import { pathToString, classifyPath, label } from './engine/dag';
+import { pathToString, classifyPath, label, descendants } from './engine/dag';
+import { classifyNodeRole } from './engine/roles';
 import './App.css';
 
 const DIFF_INFO = {
@@ -207,8 +208,48 @@ function App() {
               ))}
             </div>
 
+            {/* Variable-by-variable explanation (always shown) */}
+            <div className="var-explain">
+              <h4>Por que cada variable?</h4>
+              {dag.nodes.filter(n => n.id !== dag.exposure && n.id !== dag.outcome).map(node => {
+                const role = classifyNodeRole(dag, node.id);
+                const isInSet = correctSets.some(s => s.includes(node.id));
+                const isDescendant = descendants(dag, dag.exposure).has(node.id);
+                let reason = '';
+                let icon = '';
+                if (role === 'confounder') {
+                  reason = `Causa comun de ${expLabel} y ${outLabel} — AJUSTAR`;
+                  icon = '\u2713';
+                } else if (role === 'mediator') {
+                  reason = `En el camino causal ${expLabel} \u2192 ${outLabel} — NO ajustar`;
+                  icon = '\u2717';
+                } else if (role === 'collider') {
+                  reason = 'Colisionador — NO ajustar (abriria camino espurio)';
+                  icon = '\u2717';
+                } else if (isDescendant) {
+                  reason = `Descendiente de ${expLabel} — NO puede estar en el conjunto`;
+                  icon = '\u2717';
+                } else if (role === 'ancestor') {
+                  reason = isInSet
+                    ? 'Ancestro que bloquea un backdoor path — AJUSTAR'
+                    : 'Ancestro sin efecto en los caminos — no necesario';
+                  icon = isInSet ? '\u2713' : '\u2013';
+                } else {
+                  reason = isInSet ? 'Necesario para bloquear backdoor — AJUSTAR' : 'No afecta los caminos';
+                  icon = isInSet ? '\u2713' : '\u2013';
+                }
+                return (
+                  <div key={node.id} className={`var-row ${isInSet ? 'in-set' : ''}`}>
+                    <span className="var-icon">{icon}</span>
+                    <span className="var-name">{node.label}</span>
+                    <span className="var-reason">{reason}</span>
+                  </div>
+                );
+              })}
+            </div>
+
             <button className="btn-link" onClick={() => setShowExplain(!showExplain)}>
-              {showExplain ? '\u25B2 Ocultar explicacion' : '\u25BC Ver explicacion'}
+              {showExplain ? '\u25B2 Ocultar caminos' : '\u25BC Ver caminos en detalle'}
             </button>
 
             {showExplain && paths && (
