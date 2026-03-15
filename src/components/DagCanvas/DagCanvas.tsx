@@ -159,18 +159,61 @@ function layout(g: DagGraph): Pos[] {
   }));
 }
 
-// ─── Simple straight-line edges ─────────────────────────────────────
+// ─── Edge routing: straight lines, curve only when hitting a node ────
 
-function edgeLine(src: Pos, tgt: Pos): string {
+function distToSeg(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+  const dx = x2 - x1, dy = y2 - y1;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < 1) return Math.hypot(px - x1, py - y1);
+  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / lenSq));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+function buildEdge(
+  src: Pos, tgt: Pos,
+  allPositions: Pos[],
+  srcId: string, tgtId: string,
+): string {
   const dx = tgt.x - src.x, dy = tgt.y - src.y;
   const len = Math.hypot(dx, dy);
   if (len < 1) return '';
   const ux = dx / len, uy = dy / len;
+
   const x1 = src.x + ux * (R + 2);
   const y1 = src.y + uy * (R + 2);
   const x2 = tgt.x - ux * (R + 10);
   const y2 = tgt.y - uy * (R + 10);
-  return `M${x1},${y1} L${x2},${y2}`;
+
+  // Check if straight line hits any node
+  const AVOID = R + 12;
+  let obstruction: Pos | null = null;
+  let minDist = Infinity;
+
+  for (const p of allPositions) {
+    if (p.id === srcId || p.id === tgtId) continue;
+    const d = distToSeg(p.x, p.y, x1, y1, x2, y2);
+    if (d < AVOID && d < minDist) {
+      minDist = d;
+      obstruction = p;
+    }
+  }
+
+  if (!obstruction) {
+    return `M${x1},${y1} L${x2},${y2}`;
+  }
+
+  // Curve to avoid: go to the side with more room
+  // Check how much space is to the left vs right of the obstructing node
+  const leftSpace = obstruction.x - Math.min(x1, x2);
+  const rightSpace = Math.max(x1, x2) - obstruction.x;
+  const goRight = rightSpace >= leftSpace;
+
+  // Control point: offset horizontally from the obstruction
+  const offset = AVOID + 35;
+  const cpx = obstruction.x + (goRight ? offset : -offset);
+  const cpy = obstruction.y;
+
+  return `M${x1},${y1} Q${cpx},${cpy} ${x2},${y2}`;
 }
 
 // ─── Component ──────────────────────────────────────────────────────
@@ -204,11 +247,11 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
           </marker>
         </defs>
 
-        {/* Edges — simple straight lines */}
+        {/* Edges */}
         {graph.edges.map((e, i) => {
           const s = posMap.get(e.source), t = posMap.get(e.target);
           if (!s || !t) return null;
-          const d = edgeLine(s, t);
+          const d = buildEdge(s, t, positions, e.source, e.target);
           if (!d) return null;
           return <path key={i} d={d} fill="none"
             stroke="#94a3b8" strokeWidth={2.5} markerEnd="url(#ah)" />;
