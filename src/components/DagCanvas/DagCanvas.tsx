@@ -159,100 +159,94 @@ function enforceSpacing(layer: string[], posX: Map<string, number>, gap: number,
 }
 
 /**
- * Build edge paths that don't overlap.
+ * Build edge paths with port-based separation.
  *
- * Strategy: for each edge, compute the angle from source to target.
- * When multiple edges leave the same source, spread their exit angles.
- * When multiple edges arrive at the same target, spread their entry angles.
- * Use quadratic bezier curves so the paths visually separate.
+ * Instead of curving lines, each edge exits/enters the circle at a specific
+ * point on the perimeter ("port"). When a node has multiple outgoing or
+ * incoming edges, the ports are spread around the relevant side of the circle
+ * so the lines never overlap.
  */
 function buildEdgePaths(
   edges: { source: string; target: string }[],
   posMap: Map<string, Pos>,
 ): string[] {
-  // Group edge indices by source and by target
-  const bySource = new Map<string, number[]>();
-  const byTarget = new Map<string, number[]>();
+  // For each node, collect outgoing and incoming edge indices
+  const outgoing = new Map<string, number[]>();
+  const incoming = new Map<string, number[]>();
   edges.forEach((e, i) => {
-    if (!bySource.has(e.source)) bySource.set(e.source, []);
-    bySource.get(e.source)!.push(i);
-    if (!byTarget.has(e.target)) byTarget.set(e.target, []);
-    byTarget.get(e.target)!.push(i);
+    if (!outgoing.has(e.source)) outgoing.set(e.source, []);
+    outgoing.get(e.source)!.push(i);
+    if (!incoming.has(e.target)) incoming.set(e.target, []);
+    incoming.get(e.target)!.push(i);
   });
 
-  // For each edge, compute a "curve factor" based on how many siblings it has
-  // and its position among them (sorted by target/source angle)
-  const curveFactor = new Array(edges.length).fill(0);
+  // For each edge, compute the exit point on source circle and entry point on target circle
+  const exitPts: { x: number; y: number }[] = [];
+  const entryPts: { x: number; y: number }[] = [];
 
-  // Process edges sharing a SOURCE: sort by angle to their targets, spread
-  for (const [srcId, indices] of bySource) {
-    if (indices.length < 2) continue;
-    const src = posMap.get(srcId)!;
-    // Sort by angle to target
-    const sorted = [...indices].sort((a, b) => {
-      const ta = posMap.get(edges[a].target)!;
-      const tb = posMap.get(edges[b].target)!;
-      return Math.atan2(ta.y - src.y, ta.x - src.x) - Math.atan2(tb.y - src.y, tb.x - src.x);
-    });
-    // Assign curve factor: spread evenly from -1 to +1
-    for (let j = 0; j < sorted.length; j++) {
-      const t = sorted.length === 1 ? 0 : (j / (sorted.length - 1)) * 2 - 1;
-      curveFactor[sorted[j]] += t;
+  // Process outgoing ports: sort edges by angle to their target, spread ports
+  for (const [nodeId, indices] of outgoing) {
+    const node = posMap.get(nodeId)!;
+    if (indices.length === 1) {
+      // Single edge: exit straight toward target
+      const tgt = posMap.get(edges[indices[0]].target)!;
+      const a = Math.atan2(tgt.y - node.y, tgt.x - node.x);
+      exitPts[indices[0]] = { x: node.x + Math.cos(a) * (R + 2), y: node.y + Math.sin(a) * (R + 2) };
+    } else {
+      // Multiple edges: sort by angle to target, then spread ports
+      const sorted = [...indices].sort((a, b) => {
+        const ta = posMap.get(edges[a].target)!;
+        const tb = posMap.get(edges[b].target)!;
+        return Math.atan2(ta.y - node.y, ta.x - node.x) - Math.atan2(tb.y - node.y, tb.x - node.x);
+      });
+      // Compute the angular range of targets
+      const angles = sorted.map(i => {
+        const t = posMap.get(edges[i].target)!;
+        return Math.atan2(t.y - node.y, t.x - node.x);
+      });
+      // Spread ports within a range around the mean angle
+      const spreadAngle = Math.min(0.8, 0.25 * sorted.length); // radians of spread
+      for (let j = 0; j < sorted.length; j++) {
+        const baseAngle = angles[j];
+        const offset = sorted.length === 1 ? 0
+          : (j / (sorted.length - 1) - 0.5) * spreadAngle;
+        const a = baseAngle + offset;
+        exitPts[sorted[j]] = { x: node.x + Math.cos(a) * (R + 2), y: node.y + Math.sin(a) * (R + 2) };
+      }
     }
   }
 
-  // Process edges sharing a TARGET: sort by angle from their sources, spread
-  for (const [tgtId, indices] of byTarget) {
-    if (indices.length < 2) continue;
-    const tgt = posMap.get(tgtId)!;
-    const sorted = [...indices].sort((a, b) => {
-      const sa = posMap.get(edges[a].source)!;
-      const sb = posMap.get(edges[b].source)!;
-      return Math.atan2(sa.y - tgt.y, sa.x - tgt.x) - Math.atan2(sb.y - tgt.y, sb.x - tgt.x);
-    });
-    for (let j = 0; j < sorted.length; j++) {
-      const t = sorted.length === 1 ? 0 : (j / (sorted.length - 1)) * 2 - 1;
-      curveFactor[sorted[j]] += t;
+  // Process incoming ports: sort edges by angle from their source, spread ports
+  for (const [nodeId, indices] of incoming) {
+    const node = posMap.get(nodeId)!;
+    if (indices.length === 1) {
+      const src = posMap.get(edges[indices[0]].source)!;
+      const a = Math.atan2(src.y - node.y, src.x - node.x);
+      entryPts[indices[0]] = { x: node.x + Math.cos(a) * (R + 8), y: node.y + Math.sin(a) * (R + 8) };
+    } else {
+      const sorted = [...indices].sort((a, b) => {
+        const sa = posMap.get(edges[a].source)!;
+        const sb = posMap.get(edges[b].source)!;
+        return Math.atan2(sa.y - node.y, sa.x - node.x) - Math.atan2(sb.y - node.y, sb.x - node.x);
+      });
+      const spreadAngle = Math.min(1.0, 0.3 * sorted.length);
+      for (let j = 0; j < sorted.length; j++) {
+        const src = posMap.get(edges[sorted[j]].source)!;
+        const baseAngle = Math.atan2(src.y - node.y, src.x - node.x);
+        const offset = sorted.length === 1 ? 0
+          : (j / (sorted.length - 1) - 0.5) * spreadAngle;
+        const a = baseAngle + offset;
+        entryPts[sorted[j]] = { x: node.x + Math.cos(a) * (R + 8), y: node.y + Math.sin(a) * (R + 8) };
+      }
     }
   }
 
-  // Build SVG paths
-  return edges.map((e, i) => {
-    const src = posMap.get(e.source);
-    const tgt = posMap.get(e.target);
-    if (!src || !tgt) return '';
-
-    const dx = tgt.x - src.x;
-    const dy = tgt.y - src.y;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    if (len < 1) return '';
-
-    const ux = dx / len;
-    const uy = dy / len;
-
-    // Start/end points on circle edges
-    const x1 = src.x + ux * (R + 3);
-    const y1 = src.y + uy * (R + 3);
-    const x2 = tgt.x - ux * (R + 10);
-    const y2 = tgt.y - uy * (R + 10);
-
-    const cf = curveFactor[i];
-
-    if (Math.abs(cf) < 0.15) {
-      // Nearly straight
-      return `M${x1},${y1} L${x2},${y2}`;
-    }
-
-    // Perpendicular offset for control point
-    // Scale by distance so short edges curve less
-    const perpScale = Math.min(len * 0.25, 60);
-    const px = -uy * cf * perpScale;
-    const py = ux * cf * perpScale;
-
-    const mx = (x1 + x2) / 2 + px;
-    const my = (y1 + y2) / 2 + py;
-
-    return `M${x1},${y1} Q${mx},${my} ${x2},${y2}`;
+  // Build straight-line paths from exit port to entry port
+  return edges.map((_, i) => {
+    const ex = exitPts[i];
+    const en = entryPts[i];
+    if (!ex || !en) return '';
+    return `M${ex.x},${ex.y} L${en.x},${en.y}`;
   });
 }
 
