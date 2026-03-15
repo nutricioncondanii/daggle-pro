@@ -139,6 +139,35 @@ function layout(g: DagGraph): Pos[] {
         }
       }
     }
+
+    // Edge-node repulsion: push nodes away from edges that don't belong to them
+    // This prevents nodes from sitting on top of arrows
+    for (const edge of g.edges) {
+      const sx = x.get(edge.source)!, tx = x.get(edge.target)!;
+      const sy = (depth.get(edge.source) || 0) * yGap;
+      const ty = (depth.get(edge.target) || 0) * yGap;
+
+      for (const node of g.nodes) {
+        if (node.id === edge.source || node.id === edge.target) continue;
+        const nx = x.get(node.id)!;
+        const ny = (depth.get(node.id) || 0) * yGap;
+
+        // Only check nodes whose Y is between source and target Y
+        if (ny <= Math.min(sy, ty) || ny >= Math.max(sy, ty)) continue;
+
+        // Project node onto the edge line to find closest X on the edge at this Y
+        const t = (ny - sy) / ((ty - sy) || 1);
+        const edgeXAtNodeY = sx + t * (tx - sx);
+        const dist = Math.abs(nx - edgeXAtNodeY);
+
+        if (dist < R * 2.5) {
+          // Push node away from the edge
+          const push = (R * 2.5 - dist) * 0.3;
+          const dir = nx >= edgeXAtNodeY ? 1 : -1;
+          vx.set(node.id, (vx.get(node.id) || 0) + dir * push);
+        }
+      }
+    }
   }
 
   // Step 4: Re-center everything
