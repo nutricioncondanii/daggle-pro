@@ -260,7 +260,7 @@ function layout(g: DagGraph): LayoutResult {
 
 // ─── Edge rendering ─────────────────────────────────────────────────
 
-function buildRoutedEdge(waypoints: Pos[]): string {
+function buildRoutedEdge(waypoints: Pos[], edgeIndex: number): string {
   if (waypoints.length < 2) return '';
 
   const first = waypoints[0];
@@ -281,18 +281,44 @@ function buildRoutedEdge(waypoints: Pos[]): string {
     return `M${x1},${y1} L${x2},${y2}`;
   }
 
-  // Multi-segment through dummies — smooth cubic bezier curve
-  // Use dummy positions as curve guidance points
-  const dummies = waypoints.slice(1, -1); // just the intermediate dummy points
+  // Skip-edge: goes through dummy nodes — ALWAYS curve outward
+  // Use the dummy positions but guarantee a minimum horizontal offset
+  // so the curve is visually distinct from straight lines
+
+  // Determine curve direction: alternate left/right based on edge index
+  const curveDir = edgeIndex % 2 === 0 ? -1 : 1;
+
+  // Minimum offset so curve is always visible (at least 50px from straight line)
+  const MIN_OFFSET = 55;
+
+  const dummies = waypoints.slice(1, -1);
 
   if (dummies.length === 1) {
-    // Single dummy: quadratic bezier through it
-    return `M${x1},${y1} Q${dummies[0].x},${dummies[0].y} ${x2},${y2}`;
+    const d = dummies[0];
+    // Check if dummy is too close to the straight line between source/target
+    const midX = (x1 + x2) / 2;
+    const offset = d.x - midX;
+    let cpx = d.x;
+    if (Math.abs(offset) < MIN_OFFSET) {
+      // Force the control point outward
+      cpx = midX + curveDir * MIN_OFFSET;
+    }
+    return `M${x1},${y1} Q${cpx},${d.y} ${x2},${y2}`;
   }
 
-  // Multiple dummies: cubic bezier using first and last dummy as control points
-  const cp1 = dummies[0];
-  const cp2 = dummies[dummies.length - 1];
+  // Multiple dummies: cubic bezier
+  const cp1 = { ...dummies[0] };
+  const cp2 = { ...dummies[dummies.length - 1] };
+  const midX = (x1 + x2) / 2;
+
+  // Ensure control points have enough horizontal offset
+  if (Math.abs(cp1.x - midX) < MIN_OFFSET) {
+    cp1.x = midX + curveDir * MIN_OFFSET;
+  }
+  if (Math.abs(cp2.x - midX) < MIN_OFFSET) {
+    cp2.x = midX + curveDir * MIN_OFFSET;
+  }
+
   return `M${x1},${y1} C${cp1.x},${cp1.y} ${cp2.x},${cp2.y} ${x2},${y2}`;
 }
 
@@ -376,7 +402,7 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
           const route = routes.get(i);
           if (!route) return null;
           const waypoints = route.map(id => posMap.get(id)).filter(Boolean) as Pos[];
-          const d = buildRoutedEdge(waypoints);
+          const d = buildRoutedEdge(waypoints, i);
           if (!d) return null;
 
           const isHi = highlightedEdges?.has(i);
