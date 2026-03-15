@@ -92,7 +92,7 @@ function layout(g: DagGraph): LayoutResult {
     }
   });
 
-  // ── 3. Build layer groups (real + dummy nodes) ──
+  // ── 3. Build layer groups + barycenter pre-ordering ──
   const yGap = 150;
   const cx = 350;
   const xGap = 160;
@@ -104,14 +104,66 @@ function layout(g: DagGraph): LayoutResult {
     byDepth.get(d)!.push(id);
   }
 
-  // Initial X positions
+  // Build adjacency for sim edges (children/parents including dummies)
+  const simFwd = new Map<string, string[]>();
+  const simBwd = new Map<string, string[]>();
+  for (const id of allIds) { simFwd.set(id, []); simBwd.set(id, []); }
+  for (const e of simEdges) {
+    simFwd.get(e.source)?.push(e.target);
+    simBwd.get(e.target)?.push(e.source);
+  }
+
+  // PRE-ORDER: sort each layer by average X of children (barycenter), 6 passes
+  // This ensures nodes start in a position where crossings are minimized
+  const order = new Map<string, number>();
+  const maxDepth = Math.max(...[...byDepth.keys()]);
+
+  // Initialize order
+  for (const [, ids] of byDepth) {
+    ids.forEach((id, i) => order.set(id, i));
+  }
+
+  for (let pass = 0; pass < 8; pass++) {
+    // Forward: sort each layer by avg order of parents
+    for (let d = 1; d <= maxDepth; d++) {
+      const ids = byDepth.get(d);
+      if (!ids) continue;
+      const scored = ids.map(id => {
+        const parents = simBwd.get(id) || [];
+        const avg = parents.length > 0
+          ? parents.reduce((s, p) => s + (order.get(p) || 0), 0) / parents.length
+          : order.get(id) || 0;
+        return { id, score: avg };
+      });
+      scored.sort((a, b) => a.score - b.score);
+      byDepth.set(d, scored.map(s => s.id));
+      scored.forEach((s, i) => order.set(s.id, i));
+    }
+    // Backward: sort each layer by avg order of children
+    for (let d = maxDepth - 1; d >= 0; d--) {
+      const ids = byDepth.get(d);
+      if (!ids) continue;
+      const scored = ids.map(id => {
+        const children = simFwd.get(id) || [];
+        const avg = children.length > 0
+          ? children.reduce((s, c) => s + (order.get(c) || 0), 0) / children.length
+          : order.get(id) || 0;
+        return { id, score: avg };
+      });
+      scored.sort((a, b) => a.score - b.score);
+      byDepth.set(d, scored.map(s => s.id));
+      scored.forEach((s, i) => order.set(s.id, i));
+    }
+  }
+
+  // Assign initial X based on pre-ordered layers
   const x = new Map<string, number>();
   for (const [, ids] of byDepth) {
     const w = (ids.length - 1) * xGap;
     ids.forEach((id, i) => x.set(id, cx + i * xGap - w / 2));
   }
 
-  // ── 4. Force simulation (X only) ──
+  // ── 4. Force simulation with temperature (simulated annealing) ──
   const allNodeIds = [...allIds];
   const totalNodes = allNodeIds.length;
   const vx = new Map<string, number>();
@@ -121,8 +173,12 @@ function layout(g: DagGraph): LayoutResult {
   const SPRING = 0.03;
   const DAMPING = 0.85;
   const MIN_DIST = R * 3;
+  const ITERATIONS = 150;
 
-  for (let iter = 0; iter < 150; iter++) {
+  for (let iter = 0; iter < ITERATIONS; iter++) {
+    // Temperature: high at start (random jitter), decays to 0
+    const temp = 8 * Math.max(0, 1 - iter / 40);
+
     // Node-node repulsion (horizontal)
     for (let i = 0; i < totalNodes; i++) {
       for (let j = i + 1; j < totalNodes; j++) {
@@ -151,6 +207,13 @@ function layout(g: DagGraph): LayoutResult {
     // Center gravity
     for (const id of allNodeIds) {
       vx.set(id, (vx.get(id) || 0) + (cx - (x.get(id) || cx)) * 0.003);
+    }
+
+    // Temperature jitter (helps escape local minima)
+    if (temp > 0.5) {
+      for (const id of allNodeIds) {
+        vx.set(id, (vx.get(id) || 0) + (Math.random() - 0.5) * temp);
+      }
     }
 
     // Apply velocities
