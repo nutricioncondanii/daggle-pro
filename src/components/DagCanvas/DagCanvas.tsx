@@ -159,80 +159,106 @@ function enforceSpacing(layer: string[], posX: Map<string, number>, gap: number,
 }
 
 /** Distance from point (px,py) to the line segment (x1,y1)-(x2,y2) */
-function distToSegment(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+function distToSeg(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
   const dx = x2 - x1, dy = y2 - y1;
   const lenSq = dx * dx + dy * dy;
-  if (lenSq < 1) return Math.sqrt((px - x1) ** 2 + (py - y1) ** 2);
-  let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
-  t = Math.max(0, Math.min(1, t));
-  const projX = x1 + t * dx;
-  const projY = y1 + t * dy;
-  return Math.sqrt((px - projX) ** 2 + (py - projY) ** 2);
-}
-
-/** Which side of the line (x1,y1)→(x2,y2) is point (px,py)? >0 = left, <0 = right */
-function sideOf(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
-  return (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1);
+  if (lenSq < 1) return Math.hypot(px - x1, py - y1);
+  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / lenSq));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
 }
 
 /**
- * Build edge paths. Simple straight lines from circle edge to circle edge,
- * but if the line passes too close to an intermediate node, curve around it.
+ * Build edge paths with node-avoidance.
+ *
+ * Rules:
+ * 1. Default: straight line from source circle edge to target circle edge.
+ * 2. If the straight line would pass within AVOID_RADIUS of any intermediate
+ *    node, curve to the RIGHT side to avoid it.
+ * 3. When multiple edges share source or target and would overlap, assign
+ *    alternating curve directions (left/right) so they fan out.
  */
 function buildEdgePaths(
   edges: { source: string; target: string }[],
   posMap: Map<string, Pos>,
   allNodes: { id: string }[],
 ): string[] {
-  const AVOID_RADIUS = R + 18; // how far to stay from intermediate nodes
+  const AVOID = R + 15;
 
-  return edges.map(e => {
+  // Track how many edges share a source→ or →target to assign alternating sides
+  const srcCount = new Map<string, number>();
+  const tgtCount = new Map<string, number>();
+  const srcIdx = new Map<string, number>(); // running index per source
+  const tgtIdx = new Map<string, number>();
+  for (const e of edges) {
+    srcCount.set(e.source, (srcCount.get(e.source) || 0) + 1);
+    tgtCount.set(e.target, (tgtCount.get(e.target) || 0) + 1);
+  }
+
+  return edges.map((e) => {
     const src = posMap.get(e.source);
     const tgt = posMap.get(e.target);
     if (!src || !tgt) return '';
 
+    // Running index for this source/target
+    const si = srcIdx.get(e.source) || 0;
+    srcIdx.set(e.source, si + 1);
+    const ti = tgtIdx.get(e.target) || 0;
+    tgtIdx.set(e.target, ti + 1);
+
     const dx = tgt.x - src.x, dy = tgt.y - src.y;
-    const len = Math.sqrt(dx * dx + dy * dy);
+    const len = Math.hypot(dx, dy);
     if (len < 1) return '';
     const ux = dx / len, uy = dy / len;
 
-    // Start and end on circle edges
+    // Points on circle edges
     const x1 = src.x + ux * (R + 2);
     const y1 = src.y + uy * (R + 2);
     const x2 = tgt.x - ux * (R + 10);
     const y2 = tgt.y - uy * (R + 10);
 
-    // Check if the straight line passes too close to any intermediate node
-    let worstNode: Pos | null = null;
-    let worstDist = Infinity;
-
+    // Check for collisions with intermediate nodes
+    let collides = false;
     for (const n of allNodes) {
       if (n.id === e.source || n.id === e.target) continue;
       const np = posMap.get(n.id);
       if (!np) continue;
-      const d = distToSegment(np.x, np.y, x1, y1, x2, y2);
-      if (d < AVOID_RADIUS && d < worstDist) {
-        worstDist = d;
-        worstNode = np;
+      if (distToSeg(np.x, np.y, x1, y1, x2, y2) < AVOID) {
+        collides = true;
+        break;
       }
     }
 
-    if (!worstNode) {
-      // No collision — straight line
+    // Also check if multiple edges share this source or target
+    const srcN = srcCount.get(e.source) || 1;
+    const tgtN = tgtCount.get(e.target) || 1;
+    const needsCurve = collides || srcN >= 3 || tgtN >= 3;
+
+    if (!needsCurve && srcN < 2 && tgtN < 2) {
       return `M${x1},${y1} L${x2},${y2}`;
     }
 
-    // Curve around the obstructing node
-    // Put the control point on the opposite side of the obstructing node
-    const side = sideOf(worstNode.x, worstNode.y, x1, y1, x2, y2);
-    const curveDir = side > 0 ? -1 : 1; // curve away from the node
+    // Compute curve direction and magnitude
+    // Use a combination of source and target index to alternate sides
+    const comboIdx = si + ti;
+    const dir = comboIdx % 2 === 0 ? 1 : -1;
 
+    // Magnitude: larger for collisions, smaller for just fan-out
+    let mag: number;
+    if (collides) {
+      mag = AVOID + 30; // enough to clear the node
+    } else {
+      // Fan-out: spread based on how many siblings
+      const total = Math.max(srcN, tgtN);
+      const pos = comboIdx - Math.floor((total - 1) / 2);
+      mag = pos * 18;
+      if (Math.abs(mag) < 5) return `M${x1},${y1} L${x2},${y2}`;
+    }
+
+    // Perpendicular control point
     const mx = (x1 + x2) / 2;
     const my = (y1 + y2) / 2;
-    // Perpendicular offset: enough to clear the node
-    const offset = AVOID_RADIUS + 20;
-    const cpx = mx + (-uy) * curveDir * offset;
-    const cpy = my + ux * curveDir * offset;
+    const cpx = mx + (-uy) * dir * Math.abs(mag);
+    const cpy = my + ux * dir * Math.abs(mag);
 
     return `M${x1},${y1} Q${cpx},${cpy} ${x2},${y2}`;
   });
