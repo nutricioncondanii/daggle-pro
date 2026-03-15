@@ -11,258 +11,169 @@ interface Props {
   height?: number;
 }
 
-const R = 32; // node radius
+const R = 32;
 
 interface Pos { id: string; x: number; y: number }
 
+// ─── Force-directed layout with fixed Y layers ─────────────────────
+
 function layout(g: DagGraph): Pos[] {
-  // ── Step 1: Topological layering (Kahn's) ──
+  const n = g.nodes.length;
+  if (n === 0) return [];
+
+  // Step 1: Topological layering for Y (Kahn's)
   const inDeg = new Map<string, number>();
   const fwd = new Map<string, string[]>();
-  const bwd = new Map<string, string[]>();
-  g.nodes.forEach(n => { inDeg.set(n.id, 0); fwd.set(n.id, []); bwd.set(n.id, []); });
+  g.nodes.forEach(n => { inDeg.set(n.id, 0); fwd.set(n.id, []); });
   g.edges.forEach(e => {
     inDeg.set(e.target, (inDeg.get(e.target) || 0) + 1);
     fwd.get(e.source)?.push(e.target);
-    bwd.get(e.target)?.push(e.source);
   });
 
-  const layers: string[][] = [];
-  let q = g.nodes.filter(n => inDeg.get(n.id) === 0).map(n => n.id);
-  const assigned = new Set<string>();
-  while (q.length) {
-    const layer: string[] = [];
+  const depth = new Map<string, number>();
+  let queue = g.nodes.filter(n => inDeg.get(n.id) === 0).map(n => n.id);
+  const visited = new Set<string>();
+  let curDepth = 0;
+
+  while (queue.length) {
     const next: string[] = [];
-    for (const n of q) {
-      if (assigned.has(n)) continue;
-      assigned.add(n);
-      layer.push(n);
-      for (const c of fwd.get(n) || []) {
+    for (const id of queue) {
+      if (visited.has(id)) continue;
+      visited.add(id);
+      depth.set(id, curDepth);
+      for (const c of fwd.get(id) || []) {
         inDeg.set(c, (inDeg.get(c) || 1) - 1);
         if (inDeg.get(c) === 0) next.push(c);
       }
     }
-    if (layer.length) layers.push(layer);
-    q = next;
+    if (next.length > 0 || queue.some(id => !visited.has(id))) curDepth++;
+    queue = next;
   }
-  for (const n of g.nodes) {
-    if (!assigned.has(n.id)) { layers.push([n.id]); assigned.add(n.id); }
+  // Assign remaining nodes
+  for (const node of g.nodes) {
+    if (!depth.has(node.id)) depth.set(node.id, curDepth++);
   }
 
-  const xGap = 180;
   const yGap = 150;
+
+  // Step 2: Initial X — spread nodes at each depth evenly
+  const byDepth = new Map<number, string[]>();
+  for (const node of g.nodes) {
+    const d = depth.get(node.id) || 0;
+    if (!byDepth.has(d)) byDepth.set(d, []);
+    byDepth.get(d)!.push(node.id);
+  }
+
   const cx = 350;
-
-  // ── Step 2: Barycenter ORDERING — sort nodes in each layer to reduce crossings ──
-  // Give each node an initial "order" index within its layer
-  const order = new Map<string, number>();
-  for (const layer of layers) {
-    for (let i = 0; i < layer.length; i++) order.set(layer[i], i);
+  const xGap = 160;
+  const x = new Map<string, number>();
+  for (const [, nodes] of byDepth) {
+    const w = (nodes.length - 1) * xGap;
+    nodes.forEach((id, i) => x.set(id, cx + i * xGap - w / 2));
   }
 
-  // Multiple passes: reorder each layer by the average order of connected nodes
-  for (let pass = 0; pass < 6; pass++) {
-    // Forward pass
-    for (let li = 1; li < layers.length; li++) {
-      const baryValues: { id: string; bary: number }[] = [];
-      for (const node of layers[li]) {
-        const pars = bwd.get(node) || [];
-        if (pars.length > 0) {
-          const avg = pars.reduce((s, p) => s + (order.get(p) || 0), 0) / pars.length;
-          baryValues.push({ id: node, bary: avg });
-        } else {
-          baryValues.push({ id: node, bary: order.get(node) || 0 });
+  // Step 3: Force simulation (X only, Y is fixed)
+  const vx = new Map<string, number>();
+  g.nodes.forEach(n => vx.set(n.id, 0));
+
+  const REPULSION = 8000;
+  const SPRING = 0.04;
+  const DAMPING = 0.85;
+  const MIN_DIST = R * 3;
+
+  for (let iter = 0; iter < 120; iter++) {
+    // Repulsion: every pair pushes apart horizontally
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const a = g.nodes[i].id, b = g.nodes[j].id;
+        const ax = x.get(a)!, bx = x.get(b)!;
+        const ay = (depth.get(a) || 0) * yGap;
+        const by = (depth.get(b) || 0) * yGap;
+        const dx = bx - ax;
+        const dy = by - ay;
+        const distSq = dx * dx + dy * dy;
+        const dist = Math.sqrt(distSq) || 1;
+
+        // Only apply horizontal repulsion
+        const force = REPULSION / (distSq || 1);
+        const fx = (dx / dist) * force;
+
+        vx.set(a, (vx.get(a) || 0) - fx);
+        vx.set(b, (vx.get(b) || 0) + fx);
+      }
+    }
+
+    // Spring attraction along edges
+    for (const e of g.edges) {
+      const sx = x.get(e.source)!, tx = x.get(e.target)!;
+      const dx = tx - sx;
+      const force = dx * SPRING;
+      vx.set(e.source, (vx.get(e.source) || 0) + force);
+      vx.set(e.target, (vx.get(e.target) || 0) - force);
+    }
+
+    // Center gravity (weak pull toward cx)
+    for (const node of g.nodes) {
+      const nx = x.get(node.id)!;
+      vx.set(node.id, (vx.get(node.id) || 0) + (cx - nx) * 0.002);
+    }
+
+    // Apply velocities with damping
+    for (const node of g.nodes) {
+      const vel = (vx.get(node.id) || 0) * DAMPING;
+      vx.set(node.id, vel);
+      x.set(node.id, (x.get(node.id) || cx) + vel);
+    }
+
+    // Enforce minimum horizontal spacing between nodes at same depth
+    for (const [, nodes] of byDepth) {
+      if (nodes.length < 2) continue;
+      const sorted = [...nodes].sort((a, b) => (x.get(a) || 0) - (x.get(b) || 0));
+      for (let i = 1; i < sorted.length; i++) {
+        const prevX = x.get(sorted[i - 1])!;
+        const curX = x.get(sorted[i])!;
+        if (curX - prevX < MIN_DIST) {
+          const push = (MIN_DIST - (curX - prevX)) / 2;
+          x.set(sorted[i - 1], prevX - push);
+          x.set(sorted[i], curX + push);
         }
       }
-      baryValues.sort((a, b) => a.bary - b.bary);
-      layers[li] = baryValues.map(v => v.id);
-      layers[li].forEach((id, i) => order.set(id, i));
-    }
-    // Backward pass
-    for (let li = layers.length - 2; li >= 0; li--) {
-      const baryValues: { id: string; bary: number }[] = [];
-      for (const node of layers[li]) {
-        const chs = fwd.get(node) || [];
-        if (chs.length > 0) {
-          const avg = chs.reduce((s, c) => s + (order.get(c) || 0), 0) / chs.length;
-          baryValues.push({ id: node, bary: avg });
-        } else {
-          baryValues.push({ id: node, bary: order.get(node) || 0 });
-        }
-      }
-      baryValues.sort((a, b) => a.bary - b.bary);
-      layers[li] = baryValues.map(v => v.id);
-      layers[li].forEach((id, i) => order.set(id, i));
     }
   }
 
-  // ── Step 3: Assign X positions based on the new order ──
-  const posX = new Map<string, number>();
-  for (const layer of layers) {
-    const w = (layer.length - 1) * xGap;
-    for (let i = 0; i < layer.length; i++) {
-      posX.set(layer[i], cx + i * xGap - w / 2);
-    }
+  // Step 4: Re-center everything
+  let minX = Infinity, maxX = -Infinity;
+  for (const node of g.nodes) {
+    const nx = x.get(node.id)!;
+    if (nx < minX) minX = nx;
+    if (nx > maxX) maxX = nx;
   }
+  const shift = cx - (minX + maxX) / 2;
+  for (const node of g.nodes) x.set(node.id, x.get(node.id)! + shift);
 
-  // ── Step 4: Fine-tune X via barycenter positioning (keep the order, adjust positions) ──
-  for (let pass = 0; pass < 3; pass++) {
-    for (let li = 1; li < layers.length; li++) {
-      for (const node of layers[li]) {
-        const pars = bwd.get(node) || [];
-        if (pars.length > 0) {
-          const avg = pars.reduce((s, p) => s + (posX.get(p) || cx), 0) / pars.length;
-          posX.set(node, avg);
-        }
-      }
-      enforceSpacing(layers[li], posX, xGap, cx);
-    }
-    for (let li = layers.length - 2; li >= 0; li--) {
-      for (const node of layers[li]) {
-        const chs = fwd.get(node) || [];
-        if (chs.length > 0) {
-          const avg = chs.reduce((s, c) => s + (posX.get(c) || cx), 0) / chs.length;
-          posX.set(node, avg);
-        }
-      }
-      enforceSpacing(layers[li], posX, xGap, cx);
-    }
-  }
-
-  // Build result
-  const result: Pos[] = [];
-  for (let li = 0; li < layers.length; li++) {
-    for (const node of layers[li]) {
-      result.push({ id: node, x: posX.get(node) || cx, y: 70 + li * yGap });
-    }
-  }
-  return result;
+  // Build positions
+  return g.nodes.map(node => ({
+    id: node.id,
+    x: x.get(node.id) || cx,
+    y: 70 + (depth.get(node.id) || 0) * yGap,
+  }));
 }
 
-/** Push apart overlapping nodes while preserving their ORDER, then re-center */
-function enforceSpacing(layer: string[], posX: Map<string, number>, gap: number, cx: number) {
-  if (layer.length <= 1) return;
-  // Layer is already in the correct order from Step 2 — don't re-sort by X!
-  // Just ensure minimum gap between consecutive nodes
-  for (let i = 1; i < layer.length; i++) {
-    const prev = posX.get(layer[i - 1]) || 0;
-    const curr = posX.get(layer[i]) || 0;
-    if (curr - prev < gap) {
-      posX.set(layer[i], prev + gap);
-    }
-  }
-  // Re-center
-  const first = posX.get(layer[0]) || 0;
-  const last = posX.get(layer[layer.length - 1]) || 0;
-  const shift = cx - (first + last) / 2;
-  for (const n of layer) posX.set(n, (posX.get(n) || 0) + shift);
+// ─── Simple straight-line edges ─────────────────────────────────────
+
+function edgeLine(src: Pos, tgt: Pos): string {
+  const dx = tgt.x - src.x, dy = tgt.y - src.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1) return '';
+  const ux = dx / len, uy = dy / len;
+  const x1 = src.x + ux * (R + 2);
+  const y1 = src.y + uy * (R + 2);
+  const x2 = tgt.x - ux * (R + 10);
+  const y2 = tgt.y - uy * (R + 10);
+  return `M${x1},${y1} L${x2},${y2}`;
 }
 
-/** Distance from point (px,py) to the line segment (x1,y1)-(x2,y2) */
-function distToSeg(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
-  const dx = x2 - x1, dy = y2 - y1;
-  const lenSq = dx * dx + dy * dy;
-  if (lenSq < 1) return Math.hypot(px - x1, py - y1);
-  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / lenSq));
-  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
-}
-
-/**
- * Build edge paths with node-avoidance.
- *
- * Rules:
- * 1. Default: straight line from source circle edge to target circle edge.
- * 2. If the straight line would pass within AVOID_RADIUS of any intermediate
- *    node, curve to the RIGHT side to avoid it.
- * 3. When multiple edges share source or target and would overlap, assign
- *    alternating curve directions (left/right) so they fan out.
- */
-function buildEdgePaths(
-  edges: { source: string; target: string }[],
-  posMap: Map<string, Pos>,
-  allNodes: { id: string }[],
-): string[] {
-  const AVOID = R + 15;
-
-  // Track how many edges share a source→ or →target to assign alternating sides
-  const srcCount = new Map<string, number>();
-  const tgtCount = new Map<string, number>();
-  const srcIdx = new Map<string, number>(); // running index per source
-  const tgtIdx = new Map<string, number>();
-  for (const e of edges) {
-    srcCount.set(e.source, (srcCount.get(e.source) || 0) + 1);
-    tgtCount.set(e.target, (tgtCount.get(e.target) || 0) + 1);
-  }
-
-  return edges.map((e) => {
-    const src = posMap.get(e.source);
-    const tgt = posMap.get(e.target);
-    if (!src || !tgt) return '';
-
-    // Running index for this source/target
-    const si = srcIdx.get(e.source) || 0;
-    srcIdx.set(e.source, si + 1);
-    const ti = tgtIdx.get(e.target) || 0;
-    tgtIdx.set(e.target, ti + 1);
-
-    const dx = tgt.x - src.x, dy = tgt.y - src.y;
-    const len = Math.hypot(dx, dy);
-    if (len < 1) return '';
-    const ux = dx / len, uy = dy / len;
-
-    // Points on circle edges
-    const x1 = src.x + ux * (R + 2);
-    const y1 = src.y + uy * (R + 2);
-    const x2 = tgt.x - ux * (R + 10);
-    const y2 = tgt.y - uy * (R + 10);
-
-    // Check for collisions with intermediate nodes
-    let collides = false;
-    for (const n of allNodes) {
-      if (n.id === e.source || n.id === e.target) continue;
-      const np = posMap.get(n.id);
-      if (!np) continue;
-      if (distToSeg(np.x, np.y, x1, y1, x2, y2) < AVOID) {
-        collides = true;
-        break;
-      }
-    }
-
-    // Also check if multiple edges share this source or target
-    const srcN = srcCount.get(e.source) || 1;
-    const tgtN = tgtCount.get(e.target) || 1;
-    const needsCurve = collides || srcN >= 3 || tgtN >= 3;
-
-    if (!needsCurve && srcN < 2 && tgtN < 2) {
-      return `M${x1},${y1} L${x2},${y2}`;
-    }
-
-    // Compute curve direction and magnitude
-    // Use a combination of source and target index to alternate sides
-    const comboIdx = si + ti;
-    const dir = comboIdx % 2 === 0 ? 1 : -1;
-
-    // Magnitude: larger for collisions, smaller for just fan-out
-    let mag: number;
-    if (collides) {
-      mag = AVOID + 30; // enough to clear the node
-    } else {
-      // Fan-out: spread based on how many siblings
-      const total = Math.max(srcN, tgtN);
-      const pos = comboIdx - Math.floor((total - 1) / 2);
-      mag = pos * 18;
-      if (Math.abs(mag) < 5) return `M${x1},${y1} L${x2},${y2}`;
-    }
-
-    // Perpendicular control point
-    const mx = (x1 + x2) / 2;
-    const my = (y1 + y2) / 2;
-    const cpx = mx + (-uy) * dir * Math.abs(mag);
-    const cpy = my + ux * dir * Math.abs(mag);
-
-    return `M${x1},${y1} Q${cpx},${cpy} ${x2},${y2}`;
-  });
-}
+// ─── Component ──────────────────────────────────────────────────────
 
 export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick, height = 420 }: Props) {
   const positions = useMemo(() => layout(graph), [graph]);
@@ -273,8 +184,7 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
   }, [positions]);
 
   const vb = useMemo(() => {
-    const padX = 120; // extra horizontal for side labels
-    const padY = 60;
+    const padX = 120, padY = 60;
     let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
     for (const p of positions) {
       x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x);
@@ -294,15 +204,15 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
           </marker>
         </defs>
 
-        {/* Edges */}
-        {(() => {
-          const paths = buildEdgePaths(graph.edges, posMap, graph.nodes);
-          return graph.edges.map((e, i) => {
-            if (!paths[i]) return null;
-            return <path key={i} d={paths[i]} fill="none"
-              stroke="#94a3b8" strokeWidth={2.5} markerEnd="url(#ah)" />;
-          });
-        })()}
+        {/* Edges — simple straight lines */}
+        {graph.edges.map((e, i) => {
+          const s = posMap.get(e.source), t = posMap.get(e.target);
+          if (!s || !t) return null;
+          const d = edgeLine(s, t);
+          if (!d) return null;
+          return <path key={i} d={d} fill="none"
+            stroke="#94a3b8" strokeWidth={2.5} markerEnd="url(#ah)" />;
+        })}
 
         {/* Nodes */}
         {graph.nodes.map(node => {
@@ -320,22 +230,15 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
 
           if (isExp) { fill = '#172554'; stroke = '#3b82f6'; sw = 3.5; }
           else if (isOut) { fill = '#450a0a'; stroke = '#ef4444'; sw = 3.5; }
-
           if (isSel) { fill = '#164e63'; stroke = '#22d3ee'; sw = 3.5; }
-
-          if (showRoles && !isExp && !isOut && !isSel) {
-            stroke = getRoleColor(role);
-          }
+          if (showRoles && !isExp && !isOut && !isSel) stroke = getRoleColor(role);
 
           return (
             <g key={node.id} onClick={() => clickable && onNodeClick!(node.id)}
               className={clickable ? 'dag-node-click' : undefined}>
 
-              {/* Glow for selected */}
               {isSel && <circle cx={p.x} cy={p.y} r={R + 6} fill="none"
                 stroke="#22d3ee" strokeWidth={1.5} opacity={0.35} />}
-
-              {/* Hover ring for clickable */}
               {clickable && <circle cx={p.x} cy={p.y} r={R + 3} fill="none"
                 stroke="transparent" strokeWidth={2} className="hover-ring" />}
 
@@ -347,15 +250,13 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
                 {node.label}
               </text>
 
-              {/* Exposure / Outcome tag — to the right of the circle */}
               {isExp && (
                 <g pointerEvents="none">
                   <rect x={p.x + R + 6} y={p.y - 8} width={72} height={16}
                     rx={4} fill="#1e3a5f" stroke="#3b82f6" strokeWidth={1} />
                   <text x={p.x + R + 42} y={p.y} dy="0.3em" textAnchor="middle"
                     fill="#93c5fd" fontSize="9" fontWeight="700" letterSpacing="0.5">
-                    EXPOSICI&#211;N
-                  </text>
+                    EXPOSICI&#211;N</text>
                 </g>
               )}
               {isOut && (
@@ -364,12 +265,10 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
                     rx={4} fill="#450a0a" stroke="#ef4444" strokeWidth={1} />
                   <text x={p.x + R + 38} y={p.y} dy="0.3em" textAnchor="middle"
                     fill="#fca5a5" fontSize="9" fontWeight="700" letterSpacing="0.5">
-                    RESULTADO
-                  </text>
+                    RESULTADO</text>
                 </g>
               )}
 
-              {/* Role labels — to the right of the circle */}
               {showRoles && !isExp && !isOut && ROLE_LABELS[role] && (
                 <g pointerEvents="none">
                   <rect x={p.x + R + 6} y={p.y - 8}
@@ -377,8 +276,7 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
                     rx={4} fill="#0f172a" stroke={getRoleColor(role)} strokeWidth={1} opacity={0.9} />
                   <text x={p.x + R + 12} y={p.y} dy="0.3em" textAnchor="start"
                     fill={getRoleColor(role)} fontSize="9" fontWeight="600" letterSpacing="0.3">
-                    {ROLE_LABELS[role]}
-                  </text>
+                    {ROLE_LABELS[role]}</text>
                 </g>
               )}
             </g>
