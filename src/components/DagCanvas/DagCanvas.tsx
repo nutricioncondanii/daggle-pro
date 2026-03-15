@@ -158,95 +158,83 @@ function enforceSpacing(layer: string[], posX: Map<string, number>, gap: number,
   for (const n of layer) posX.set(n, (posX.get(n) || 0) + shift);
 }
 
+/** Distance from point (px,py) to the line segment (x1,y1)-(x2,y2) */
+function distToSegment(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+  const dx = x2 - x1, dy = y2 - y1;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < 1) return Math.sqrt((px - x1) ** 2 + (py - y1) ** 2);
+  let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const projX = x1 + t * dx;
+  const projY = y1 + t * dy;
+  return Math.sqrt((px - projX) ** 2 + (py - projY) ** 2);
+}
+
+/** Which side of the line (x1,y1)→(x2,y2) is point (px,py)? >0 = left, <0 = right */
+function sideOf(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+  return (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1);
+}
+
 /**
- * Build edge paths with port-based separation.
- *
- * Instead of curving lines, each edge exits/enters the circle at a specific
- * point on the perimeter ("port"). When a node has multiple outgoing or
- * incoming edges, the ports are spread around the relevant side of the circle
- * so the lines never overlap.
+ * Build edge paths. Simple straight lines from circle edge to circle edge,
+ * but if the line passes too close to an intermediate node, curve around it.
  */
 function buildEdgePaths(
   edges: { source: string; target: string }[],
   posMap: Map<string, Pos>,
+  allNodes: { id: string }[],
 ): string[] {
-  // For each node, collect outgoing and incoming edge indices
-  const outgoing = new Map<string, number[]>();
-  const incoming = new Map<string, number[]>();
-  edges.forEach((e, i) => {
-    if (!outgoing.has(e.source)) outgoing.set(e.source, []);
-    outgoing.get(e.source)!.push(i);
-    if (!incoming.has(e.target)) incoming.set(e.target, []);
-    incoming.get(e.target)!.push(i);
-  });
+  const AVOID_RADIUS = R + 18; // how far to stay from intermediate nodes
 
-  // For each edge, compute the exit point on source circle and entry point on target circle
-  const exitPts: { x: number; y: number }[] = [];
-  const entryPts: { x: number; y: number }[] = [];
+  return edges.map(e => {
+    const src = posMap.get(e.source);
+    const tgt = posMap.get(e.target);
+    if (!src || !tgt) return '';
 
-  // Process outgoing ports: sort edges by angle to their target, spread ports
-  for (const [nodeId, indices] of outgoing) {
-    const node = posMap.get(nodeId)!;
-    if (indices.length === 1) {
-      // Single edge: exit straight toward target
-      const tgt = posMap.get(edges[indices[0]].target)!;
-      const a = Math.atan2(tgt.y - node.y, tgt.x - node.x);
-      exitPts[indices[0]] = { x: node.x + Math.cos(a) * (R + 2), y: node.y + Math.sin(a) * (R + 2) };
-    } else {
-      // Multiple edges: sort by angle to target, then spread ports
-      const sorted = [...indices].sort((a, b) => {
-        const ta = posMap.get(edges[a].target)!;
-        const tb = posMap.get(edges[b].target)!;
-        return Math.atan2(ta.y - node.y, ta.x - node.x) - Math.atan2(tb.y - node.y, tb.x - node.x);
-      });
-      // Compute the angular range of targets
-      const angles = sorted.map(i => {
-        const t = posMap.get(edges[i].target)!;
-        return Math.atan2(t.y - node.y, t.x - node.x);
-      });
-      // Spread ports within a range around the mean angle
-      const spreadAngle = Math.min(0.8, 0.25 * sorted.length); // radians of spread
-      for (let j = 0; j < sorted.length; j++) {
-        const baseAngle = angles[j];
-        const offset = sorted.length === 1 ? 0
-          : (j / (sorted.length - 1) - 0.5) * spreadAngle;
-        const a = baseAngle + offset;
-        exitPts[sorted[j]] = { x: node.x + Math.cos(a) * (R + 2), y: node.y + Math.sin(a) * (R + 2) };
+    const dx = tgt.x - src.x, dy = tgt.y - src.y;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len < 1) return '';
+    const ux = dx / len, uy = dy / len;
+
+    // Start and end on circle edges
+    const x1 = src.x + ux * (R + 2);
+    const y1 = src.y + uy * (R + 2);
+    const x2 = tgt.x - ux * (R + 10);
+    const y2 = tgt.y - uy * (R + 10);
+
+    // Check if the straight line passes too close to any intermediate node
+    let worstNode: Pos | null = null;
+    let worstDist = Infinity;
+
+    for (const n of allNodes) {
+      if (n.id === e.source || n.id === e.target) continue;
+      const np = posMap.get(n.id);
+      if (!np) continue;
+      const d = distToSegment(np.x, np.y, x1, y1, x2, y2);
+      if (d < AVOID_RADIUS && d < worstDist) {
+        worstDist = d;
+        worstNode = np;
       }
     }
-  }
 
-  // Process incoming ports: sort edges by angle from their source, spread ports
-  for (const [nodeId, indices] of incoming) {
-    const node = posMap.get(nodeId)!;
-    if (indices.length === 1) {
-      const src = posMap.get(edges[indices[0]].source)!;
-      const a = Math.atan2(src.y - node.y, src.x - node.x);
-      entryPts[indices[0]] = { x: node.x + Math.cos(a) * (R + 8), y: node.y + Math.sin(a) * (R + 8) };
-    } else {
-      const sorted = [...indices].sort((a, b) => {
-        const sa = posMap.get(edges[a].source)!;
-        const sb = posMap.get(edges[b].source)!;
-        return Math.atan2(sa.y - node.y, sa.x - node.x) - Math.atan2(sb.y - node.y, sb.x - node.x);
-      });
-      const spreadAngle = Math.min(1.0, 0.3 * sorted.length);
-      for (let j = 0; j < sorted.length; j++) {
-        const src = posMap.get(edges[sorted[j]].source)!;
-        const baseAngle = Math.atan2(src.y - node.y, src.x - node.x);
-        const offset = sorted.length === 1 ? 0
-          : (j / (sorted.length - 1) - 0.5) * spreadAngle;
-        const a = baseAngle + offset;
-        entryPts[sorted[j]] = { x: node.x + Math.cos(a) * (R + 8), y: node.y + Math.sin(a) * (R + 8) };
-      }
+    if (!worstNode) {
+      // No collision — straight line
+      return `M${x1},${y1} L${x2},${y2}`;
     }
-  }
 
-  // Build straight-line paths from exit port to entry port
-  return edges.map((_, i) => {
-    const ex = exitPts[i];
-    const en = entryPts[i];
-    if (!ex || !en) return '';
-    return `M${ex.x},${ex.y} L${en.x},${en.y}`;
+    // Curve around the obstructing node
+    // Put the control point on the opposite side of the obstructing node
+    const side = sideOf(worstNode.x, worstNode.y, x1, y1, x2, y2);
+    const curveDir = side > 0 ? -1 : 1; // curve away from the node
+
+    const mx = (x1 + x2) / 2;
+    const my = (y1 + y2) / 2;
+    // Perpendicular offset: enough to clear the node
+    const offset = AVOID_RADIUS + 20;
+    const cpx = mx + (-uy) * curveDir * offset;
+    const cpy = my + ux * curveDir * offset;
+
+    return `M${x1},${y1} Q${cpx},${cpy} ${x2},${y2}`;
   });
 }
 
@@ -282,7 +270,7 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
 
         {/* Edges */}
         {(() => {
-          const paths = buildEdgePaths(graph.edges, posMap);
+          const paths = buildEdgePaths(graph.edges, posMap, graph.nodes);
           return graph.edges.map((e, i) => {
             if (!paths[i]) return null;
             return <path key={i} d={paths[i]} fill="none"
