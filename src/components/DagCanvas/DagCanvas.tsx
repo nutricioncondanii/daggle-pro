@@ -14,14 +14,20 @@ interface Props {
 const R = 32;
 
 interface Pos { id: string; x: number; y: number }
+interface SimEdge { source: string; target: string }
 
-// ─── Force-directed layout with fixed Y layers ─────────────────────
+// ─── Layout engine ──────────────────────────────────────────────────
 
-function layout(g: DagGraph): Pos[] {
-  const n = g.nodes.length;
-  if (n === 0) return [];
+interface LayoutResult {
+  positions: Pos[];
+  /** For each original edge index, the waypoints (including dummies) to route through */
+  routes: Map<number, string[]>;
+}
 
-  // Step 1: Topological layering for Y (Kahn's)
+function layout(g: DagGraph): LayoutResult {
+  if (g.nodes.length === 0) return { positions: [], routes: new Map() };
+
+  // ── 1. Topological depth (Kahn's) ──
   const inDeg = new Map<string, number>();
   const fwd = new Map<string, string[]>();
   g.nodes.forEach(n => { inDeg.set(n.id, 0); fwd.set(n.id, []); });
@@ -34,7 +40,6 @@ function layout(g: DagGraph): Pos[] {
   let queue = g.nodes.filter(n => inDeg.get(n.id) === 0).map(n => n.id);
   const visited = new Set<string>();
   let curDepth = 0;
-
   while (queue.length) {
     const next: string[] = [];
     for (const id of queue) {
@@ -46,225 +51,225 @@ function layout(g: DagGraph): Pos[] {
         if (inDeg.get(c) === 0) next.push(c);
       }
     }
-    if (next.length > 0 || queue.some(id => !visited.has(id))) curDepth++;
+    if (next.length > 0) curDepth++;
     queue = next;
   }
-  // Assign remaining nodes
-  for (const node of g.nodes) {
-    if (!depth.has(node.id)) depth.set(node.id, curDepth++);
+  for (const n of g.nodes) {
+    if (!depth.has(n.id)) depth.set(n.id, curDepth++);
   }
 
+  // ── 2. Create dummy nodes for edges that skip layers ──
+  const allIds = new Set(g.nodes.map(n => n.id));
+  const dummyIds = new Set<string>();
+  const routes = new Map<number, string[]>(); // edgeIndex → [source, dummy1, dummy2, ..., target]
+  const simEdges: SimEdge[] = []; // edges for force simulation (with dummies)
+
+  g.edges.forEach((e, idx) => {
+    const sd = depth.get(e.source) ?? 0;
+    const td = depth.get(e.target) ?? 0;
+    const span = td - sd;
+
+    if (span <= 1) {
+      // Direct edge, no dummies needed
+      routes.set(idx, [e.source, e.target]);
+      simEdges.push({ source: e.source, target: e.target });
+    } else {
+      // Insert dummy at each intermediate layer
+      const chain: string[] = [e.source];
+      let prev = e.source;
+      for (let d = sd + 1; d < td; d++) {
+        const dummyId = `__d_${idx}_${d}`;
+        dummyIds.add(dummyId);
+        allIds.add(dummyId);
+        depth.set(dummyId, d);
+        chain.push(dummyId);
+        simEdges.push({ source: prev, target: dummyId });
+        prev = dummyId;
+      }
+      chain.push(e.target);
+      simEdges.push({ source: prev, target: e.target });
+      routes.set(idx, chain);
+    }
+  });
+
+  // ── 3. Build layer groups (real + dummy nodes) ──
   const yGap = 150;
-
-  // Step 2: Initial X — spread nodes at each depth evenly
-  const byDepth = new Map<number, string[]>();
-  for (const node of g.nodes) {
-    const d = depth.get(node.id) || 0;
-    if (!byDepth.has(d)) byDepth.set(d, []);
-    byDepth.get(d)!.push(node.id);
-  }
-
   const cx = 350;
   const xGap = 160;
-  const x = new Map<string, number>();
-  for (const [, nodes] of byDepth) {
-    const w = (nodes.length - 1) * xGap;
-    nodes.forEach((id, i) => x.set(id, cx + i * xGap - w / 2));
+
+  const byDepth = new Map<number, string[]>();
+  for (const id of allIds) {
+    const d = depth.get(id) || 0;
+    if (!byDepth.has(d)) byDepth.set(d, []);
+    byDepth.get(d)!.push(id);
   }
 
-  // Step 3: Force simulation (X only, Y is fixed)
-  const vx = new Map<string, number>();
-  g.nodes.forEach(n => vx.set(n.id, 0));
+  // Initial X positions
+  const x = new Map<string, number>();
+  for (const [, ids] of byDepth) {
+    const w = (ids.length - 1) * xGap;
+    ids.forEach((id, i) => x.set(id, cx + i * xGap - w / 2));
+  }
 
-  const REPULSION = 8000;
-  const SPRING = 0.04;
+  // ── 4. Force simulation (X only) ──
+  const allNodeIds = [...allIds];
+  const totalNodes = allNodeIds.length;
+  const vx = new Map<string, number>();
+  allNodeIds.forEach(id => vx.set(id, 0));
+
+  const REPULSION = 10000;
+  const SPRING = 0.03;
   const DAMPING = 0.85;
   const MIN_DIST = R * 3;
 
-  for (let iter = 0; iter < 120; iter++) {
-    // Repulsion: every pair pushes apart horizontally
-    for (let i = 0; i < n; i++) {
-      for (let j = i + 1; j < n; j++) {
-        const a = g.nodes[i].id, b = g.nodes[j].id;
+  for (let iter = 0; iter < 150; iter++) {
+    // Node-node repulsion (horizontal)
+    for (let i = 0; i < totalNodes; i++) {
+      for (let j = i + 1; j < totalNodes; j++) {
+        const a = allNodeIds[i], b = allNodeIds[j];
         const ax = x.get(a)!, bx = x.get(b)!;
         const ay = (depth.get(a) || 0) * yGap;
         const by = (depth.get(b) || 0) * yGap;
-        const dx = bx - ax;
-        const dy = by - ay;
-        const distSq = dx * dx + dy * dy;
-        const dist = Math.sqrt(distSq) || 1;
-
-        // Only apply horizontal repulsion
-        const force = REPULSION / (distSq || 1);
+        const dx = bx - ax, dy = by - ay;
+        const distSq = dx * dx + dy * dy || 1;
+        const dist = Math.sqrt(distSq);
+        const force = REPULSION / distSq;
         const fx = (dx / dist) * force;
-
         vx.set(a, (vx.get(a) || 0) - fx);
         vx.set(b, (vx.get(b) || 0) + fx);
       }
     }
 
-    // Spring attraction along edges
-    for (const e of g.edges) {
-      const sx = x.get(e.source)!, tx = x.get(e.target)!;
-      const dx = tx - sx;
+    // Spring attraction along simulation edges
+    for (const e of simEdges) {
+      const dx = (x.get(e.target) || cx) - (x.get(e.source) || cx);
       const force = dx * SPRING;
       vx.set(e.source, (vx.get(e.source) || 0) + force);
       vx.set(e.target, (vx.get(e.target) || 0) - force);
     }
 
-    // Center gravity (weak pull toward cx)
-    for (const node of g.nodes) {
-      const nx = x.get(node.id)!;
-      vx.set(node.id, (vx.get(node.id) || 0) + (cx - nx) * 0.002);
+    // Center gravity
+    for (const id of allNodeIds) {
+      vx.set(id, (vx.get(id) || 0) + (cx - (x.get(id) || cx)) * 0.003);
     }
 
-    // Apply velocities with damping
-    for (const node of g.nodes) {
-      const vel = (vx.get(node.id) || 0) * DAMPING;
-      vx.set(node.id, vel);
-      x.set(node.id, (x.get(node.id) || cx) + vel);
+    // Apply velocities
+    for (const id of allNodeIds) {
+      const vel = (vx.get(id) || 0) * DAMPING;
+      vx.set(id, vel);
+      x.set(id, (x.get(id) || cx) + vel);
     }
 
-    // Enforce minimum horizontal spacing between nodes at same depth
-    for (const [, nodes] of byDepth) {
-      if (nodes.length < 2) continue;
-      const sorted = [...nodes].sort((a, b) => (x.get(a) || 0) - (x.get(b) || 0));
+    // Minimum spacing per layer
+    for (const [, ids] of byDepth) {
+      if (ids.length < 2) continue;
+      const sorted = [...ids].sort((a, b) => (x.get(a) || 0) - (x.get(b) || 0));
       for (let i = 1; i < sorted.length; i++) {
-        const prevX = x.get(sorted[i - 1])!;
-        const curX = x.get(sorted[i])!;
-        if (curX - prevX < MIN_DIST) {
-          const push = (MIN_DIST - (curX - prevX)) / 2;
-          x.set(sorted[i - 1], prevX - push);
-          x.set(sorted[i], curX + push);
-        }
-      }
-    }
-
-    // Edge-node repulsion: push nodes away from edges that don't belong to them
-    // This prevents nodes from sitting on top of arrows
-    for (const edge of g.edges) {
-      const sx = x.get(edge.source)!, tx = x.get(edge.target)!;
-      const sy = (depth.get(edge.source) || 0) * yGap;
-      const ty = (depth.get(edge.target) || 0) * yGap;
-
-      for (const node of g.nodes) {
-        if (node.id === edge.source || node.id === edge.target) continue;
-        const nx = x.get(node.id)!;
-        const ny = (depth.get(node.id) || 0) * yGap;
-
-        // Only check nodes whose Y is between source and target Y
-        if (ny <= Math.min(sy, ty) || ny >= Math.max(sy, ty)) continue;
-
-        // Project node onto the edge line to find closest X on the edge at this Y
-        const t = (ny - sy) / ((ty - sy) || 1);
-        const edgeXAtNodeY = sx + t * (tx - sx);
-        const dist = Math.abs(nx - edgeXAtNodeY);
-
-        if (dist < R * 2.5) {
-          // Push node away from the edge
-          const push = (R * 2.5 - dist) * 0.3;
-          const dir = nx >= edgeXAtNodeY ? 1 : -1;
-          vx.set(node.id, (vx.get(node.id) || 0) + dir * push);
+        const px = x.get(sorted[i - 1])!, cx2 = x.get(sorted[i])!;
+        if (cx2 - px < MIN_DIST) {
+          const push = (MIN_DIST - (cx2 - px)) / 2;
+          x.set(sorted[i - 1], px - push);
+          x.set(sorted[i], cx2 + push);
         }
       }
     }
   }
 
-  // Step 4: Re-center everything
+  // Re-center
   let minX = Infinity, maxX = -Infinity;
-  for (const node of g.nodes) {
-    const nx = x.get(node.id)!;
+  for (const id of allNodeIds) {
+    const nx = x.get(id)!;
     if (nx < minX) minX = nx;
     if (nx > maxX) maxX = nx;
   }
   const shift = cx - (minX + maxX) / 2;
-  for (const node of g.nodes) x.set(node.id, x.get(node.id)! + shift);
+  for (const id of allNodeIds) x.set(id, x.get(id)! + shift);
 
-  // Build positions
-  return g.nodes.map(node => ({
-    id: node.id,
-    x: x.get(node.id) || cx,
-    y: 70 + (depth.get(node.id) || 0) * yGap,
+  // Build positions for ALL nodes (real + dummy)
+  const positions: Pos[] = allNodeIds.map(id => ({
+    id,
+    x: x.get(id) || cx,
+    y: 70 + (depth.get(id) || 0) * yGap,
   }));
+
+  return { positions, routes };
 }
 
-// ─── Edge routing: straight lines, curve only when hitting a node ────
+// ─── Edge rendering ─────────────────────────────────────────────────
 
-function distToSeg(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
-  const dx = x2 - x1, dy = y2 - y1;
-  const lenSq = dx * dx + dy * dy;
-  if (lenSq < 1) return Math.hypot(px - x1, py - y1);
-  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / lenSq));
-  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
-}
+function buildRoutedEdge(waypoints: Pos[]): string {
+  if (waypoints.length < 2) return '';
 
-function buildEdge(
-  src: Pos, tgt: Pos,
-  allPositions: Pos[],
-  srcId: string, tgtId: string,
-): string {
-  const dx = tgt.x - src.x, dy = tgt.y - src.y;
-  const len = Math.hypot(dx, dy);
-  if (len < 1) return '';
-  const ux = dx / len, uy = dy / len;
+  const first = waypoints[0];
+  const last = waypoints[waypoints.length - 1];
 
-  const x1 = src.x + ux * (R + 2);
-  const y1 = src.y + uy * (R + 2);
-  const x2 = tgt.x - ux * (R + 10);
-  const y2 = tgt.y - uy * (R + 10);
+  if (waypoints.length === 2) {
+    // Direct edge — straight line
+    const dx = last.x - first.x, dy = last.y - first.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) return '';
+    const ux = dx / len, uy = dy / len;
+    return `M${first.x + ux * (R + 2)},${first.y + uy * (R + 2)} L${last.x - ux * (R + 10)},${last.y - uy * (R + 10)}`;
+  }
 
-  // Check if straight line hits any node
-  const AVOID = R + 12;
-  let obstruction: Pos | null = null;
-  let minDist = Infinity;
+  // Multi-segment through dummies — polyline
+  const parts: string[] = [];
 
-  for (const p of allPositions) {
-    if (p.id === srcId || p.id === tgtId) continue;
-    const d = distToSeg(p.x, p.y, x1, y1, x2, y2);
-    if (d < AVOID && d < minDist) {
-      minDist = d;
-      obstruction = p;
+  for (let i = 0; i < waypoints.length - 1; i++) {
+    const s = waypoints[i];
+    const t = waypoints[i + 1];
+    const dx = t.x - s.x, dy = t.y - s.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) continue;
+    const ux = dx / len, uy = dy / len;
+
+    // First segment: start from circle edge
+    // Last segment: end at circle edge (with arrow space)
+    // Middle segments: point-to-point through dummies
+    const startPad = i === 0 ? R + 2 : 0;
+    const endPad = i === waypoints.length - 2 ? R + 10 : 0;
+
+    const x1 = s.x + ux * startPad;
+    const y1 = s.y + uy * startPad;
+    const x2 = t.x - ux * endPad;
+    const y2 = t.y - uy * endPad;
+
+    if (i === 0) {
+      parts.push(`M${x1},${y1}`);
     }
+    parts.push(`L${x2},${y2}`);
   }
 
-  if (!obstruction) {
-    return `M${x1},${y1} L${x2},${y2}`;
-  }
-
-  // Curve to avoid: go to the side with more room
-  // Check how much space is to the left vs right of the obstructing node
-  const leftSpace = obstruction.x - Math.min(x1, x2);
-  const rightSpace = Math.max(x1, x2) - obstruction.x;
-  const goRight = rightSpace >= leftSpace;
-
-  // Control point: offset horizontally from the obstruction
-  const offset = AVOID + 35;
-  const cpx = obstruction.x + (goRight ? offset : -offset);
-  const cpy = obstruction.y;
-
-  return `M${x1},${y1} Q${cpx},${cpy} ${x2},${y2}`;
+  return parts.join(' ');
 }
 
 // ─── Component ──────────────────────────────────────────────────────
 
 export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick, height = 420 }: Props) {
-  const positions = useMemo(() => layout(graph), [graph]);
+  const { positions, routes } = useMemo(() => layout(graph), [graph]);
+
   const posMap = useMemo(() => {
     const m = new Map<string, Pos>();
     positions.forEach(p => m.set(p.id, p));
     return m;
   }, [positions]);
 
+  // Only real nodes (filter out dummies)
+  const realPositions = useMemo(
+    () => positions.filter(p => !p.id.startsWith('__d_')),
+    [positions]
+  );
+
   const vb = useMemo(() => {
     const padX = 120, padY = 60;
     let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
-    for (const p of positions) {
+    for (const p of realPositions) {
       x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x);
       y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
     }
     if (!isFinite(x0)) return '0 0 600 400';
     return `${x0 - padX} ${y0 - padY} ${x1 - x0 + padX * 2} ${y1 - y0 + padY * 2}`;
-  }, [positions]);
+  }, [realPositions]);
 
   return (
     <div className="dag-canvas" style={{ height }}>
@@ -276,17 +281,18 @@ export default function DagCanvas({ graph, showRoles, selectedNodes, onNodeClick
           </marker>
         </defs>
 
-        {/* Edges */}
+        {/* Edges — routed through dummy waypoints */}
         {graph.edges.map((e, i) => {
-          const s = posMap.get(e.source), t = posMap.get(e.target);
-          if (!s || !t) return null;
-          const d = buildEdge(s, t, positions, e.source, e.target);
+          const route = routes.get(i);
+          if (!route) return null;
+          const waypoints = route.map(id => posMap.get(id)).filter(Boolean) as Pos[];
+          const d = buildRoutedEdge(waypoints);
           if (!d) return null;
-          return <path key={i} d={d} fill="none"
+          return <path key={`e${i}`} d={d} fill="none"
             stroke="#94a3b8" strokeWidth={2.5} markerEnd="url(#ah)" />;
         })}
 
-        {/* Nodes */}
+        {/* Nodes (only real, not dummies) */}
         {graph.nodes.map(node => {
           const p = posMap.get(node.id);
           if (!p) return null;
