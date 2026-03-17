@@ -60,7 +60,7 @@ export function findMinimalAdjustmentSets(g: DagGraph): string[][] {
     }
   }
 
-  return filterMinimal(valid);
+  return filterSmallest(filterMinimal(valid));
 }
 
 function filterMinimal(sets: string[][]): string[][] {
@@ -72,6 +72,13 @@ function filterMinimal(sets: string[][]): string[][] {
     if (!isSuperset) minimal.push(set);
   }
   return minimal;
+}
+
+/** Keep only the sets with the smallest size */
+function filterSmallest(sets: string[][]): string[][] {
+  if (sets.length === 0) return sets;
+  const minSize = Math.min(...sets.map(s => s.length));
+  return sets.filter(s => s.length === minSize);
 }
 
 /**
